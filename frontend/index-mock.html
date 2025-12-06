@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cloud Pantry Tracker (Mock Mode)</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🍽️ Cloud Pantry Tracker</h1>
+            <p class="subtitle">Manage your shared household inventory (Mock Mode - No Backend Required)</p>
+        </header>
+
+        <div class="household-selector">
+            <label for="householdId">Household ID:</label>
+            <input type="text" id="householdId" placeholder="Enter household ID" value="household-1">
+            <button onclick="loadInventory()">Load Inventory</button>
+        </div>
+
+        <div class="add-item-section">
+            <h2>Add Item</h2>
+            <div class="form-group">
+                <input type="text" id="itemName" placeholder="Item name (e.g., Milk, Bread)" />
+                <input type="number" id="itemQuantity" placeholder="Quantity" min="1" value="1" />
+                <button onclick="addItem()">Add Item</button>
+            </div>
+        </div>
+
+        <div class="inventory-section">
+            <h2>Current Inventory</h2>
+            <div id="inventoryList" class="inventory-list">
+                <p class="empty-state">No items yet. Add your first item above!</p>
+            </div>
+        </div>
+    </div>
+
+    <script src="app-mock.js"></script>
+</body>
+</html>
+

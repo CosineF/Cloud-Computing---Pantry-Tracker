@@ -1,0 +1,9 @@
+{
+  "httpMethod": "POST",
+  "path": "/inventory",
+  "body": "{\"householdId\":\"household-1\",\"name\":\"Milk\",\"quantity\":2}",
+  "headers": {
+    "Content-Type": "application/json"
+  }
+}
+

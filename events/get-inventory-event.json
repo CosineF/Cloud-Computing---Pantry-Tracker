@@ -1,0 +1,11 @@
+{
+  "httpMethod": "GET",
+  "path": "/inventory",
+  "queryStringParameters": {
+    "householdId": "household-1"
+  },
+  "headers": {
+    "Content-Type": "application/json"
+  }
+}
+

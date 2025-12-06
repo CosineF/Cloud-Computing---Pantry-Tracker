@@ -1,0 +1,9 @@
+{
+  "httpMethod": "DELETE",
+  "path": "/inventory",
+  "body": "{\"householdId\":\"household-1\",\"itemId\":\"household-1#abc12345\"}",
+  "headers": {
+    "Content-Type": "application/json"
+  }
+}
+

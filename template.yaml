@@ -1,0 +1,397 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Cloud Pantry Tracker MVP - Simple serverless inventory management
+
+Parameters:
+  JwtSecret:
+    Type: String
+    Description: 'Secret key for JWT token signing (generate with openssl rand -hex 32)'
+    NoEcho: true
+    Default: ''
+  AlertEmail:
+    Type: String
+    Description: 'Email address for CloudWatch alarms (optional, leave empty to disable)'
+    Default: ''
+  PagerDutyIntegrationKey:
+    Type: String
+    Description: 'PagerDuty integration key (optional, leave empty to use email only)'
+    NoEcho: true
+    Default: ''
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+  HasPagerDutyKey: !Not [!Equals [!Ref PagerDutyIntegrationKey, '']]
+  IsUsEast1: !Equals [!Ref AWS::Region, 'us-east-1']
+  IsUsWest2: !Equals [!Ref AWS::Region, 'us-west-2']
+
+Globals:
+  Function:
+    Timeout: 10
+    Runtime: python3.9
+    MemorySize: 256
+
+Resources:
+  # SNS Topic for Alerts
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: PantryTrackerAlerts
+      DisplayName: Pantry Tracker Alerts
+      Subscription:
+        - !If
+          - HasAlertEmail
+          - Protocol: email
+            Endpoint: !Ref AlertEmail
+          - !Ref AWS::NoValue
+
+  # SNS Topic for PagerDuty (if configured)
+  PagerDutyTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasPagerDutyKey
+    Properties:
+      TopicName: PantryTrackerPagerDuty
+      DisplayName: Pantry Tracker PagerDuty
+
+  # Lambda Function for PagerDuty Integration
+  PagerDutyFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasPagerDutyKey
+    Properties:
+      FunctionName: PantryTrackerPagerDutyHandler
+      Runtime: python3.9
+      Handler: index.handler
+      Timeout: 10
+      MemorySize: 128
+      InlineCode: |
+        import json
+        import urllib3
+        import os
+        
+        http = urllib3.PoolManager()
+        PAGERDUTY_KEY = os.environ['PAGERDUTY_KEY']
+        
+        def handler(event, context):
+            message = json.loads(event['Records'][0]['Sns']['Message'])
+            subject = event['Records'][0]['Sns']['Subject']
+            
+            payload = {
+                "routing_key": PAGERDUTY_KEY,
+                "event_action": "trigger",
+                "payload": {
+                    "summary": subject,
+                    "severity": "critical" if "ERROR" in subject.upper() else "warning",
+                    "source": "CloudWatch",
+                    "custom_details": message
+                }
+            }
+            
+            http.request('POST', 'https://events.pagerduty.com/v2/enqueue',
+                        body=json.dumps(payload),
+                        headers={'Content-Type': 'application/json'})
+            
+            return {'statusCode': 200}
+      Environment:
+        Variables:
+          PAGERDUTY_KEY: !Ref PagerDutyIntegrationKey
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName: !Ref PagerDutyTopic
+
+  # Subscribe PagerDuty function to topic
+  PagerDutySubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasPagerDutyKey
+    Properties:
+      TopicArn: !Ref PagerDutyTopic
+      Protocol: lambda
+      Endpoint: !GetAtt PagerDutyFunction.Arn
+
+  # Permission for SNS to invoke Lambda
+  PagerDutyInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasPagerDutyKey
+    Properties:
+      FunctionName: !Ref PagerDutyFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref PagerDutyTopic
+
+  # Users Table
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: PantryUsers
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: username
+          AttributeType: S
+      KeySchema:
+        - AttributeName: username
+          KeyType: HASH
+      Tags:
+        - Key: Project
+          Value: CloudPantryTracker
+
+  # DynamoDB Table with Auto-Scaling
+  PantryInventoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: PantryInventory
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      AttributeDefinitions:
+        - AttributeName: householdId
+          AttributeType: S
+        - AttributeName: itemId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: householdId
+          KeyType: HASH
+        - AttributeName: itemId
+          KeyType: RANGE
+      Tags:
+        - Key: Project
+          Value: CloudPantryTracker
+
+  # DynamoDB Auto-Scaling for Inventory Table (Read)
+  InventoryTableReadScaling:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: 100
+      MinCapacity: 5
+      ResourceId: !Sub 'table/${PantryInventoryTable}'
+      RoleARN: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/dynamodb.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_DynamoDBTable'
+      ScalableDimension: dynamodb:table:ReadCapacityUnits
+      ServiceNamespace: dynamodb
+
+  InventoryTableReadScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: InventoryTableReadScalingPolicy
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref InventoryTableReadScaling
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 70.0
+        PredefinedMetricSpecification:
+          PredefinedMetricType: DynamoDBReadCapacityUtilization
+
+  # DynamoDB Auto-Scaling for Inventory Table (Write)
+  InventoryTableWriteScaling:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: 100
+      MinCapacity: 5
+      ResourceId: !Sub 'table/${PantryInventoryTable}'
+      RoleARN: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/dynamodb.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_DynamoDBTable'
+      ScalableDimension: dynamodb:table:WriteCapacityUnits
+      ServiceNamespace: dynamodb
+
+  InventoryTableWriteScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: InventoryTableWriteScalingPolicy
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref InventoryTableWriteScaling
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 70.0
+        PredefinedMetricSpecification:
+          PredefinedMetricType: DynamoDBWriteCapacityUtilization
+
+  # Lambda Function with Insights and Concurrency Control
+  PantryInventoryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: PantryInventoryFunction
+      CodeUri: backend/
+      Handler: lambda_function.lambda_handler
+      ReservedConcurrentExecutions: 100
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref PantryInventoryTable
+          USERS_TABLE_NAME: !Ref UsersTable
+          JWT_SECRET: !Ref JwtSecret
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PantryInventoryTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+        - CloudWatchLambdaInsightsExecutionRolePolicy:
+      Layers:
+        - !Sub 'arn:aws:lambda:${AWS::Region}:580247275435:layer:LambdaInsightsExtension:21'
+      Events:
+        InventoryApi:
+          Type: Api
+          Properties:
+            Path: /inventory
+            Method: ANY
+        InventoryApiOptions:
+          Type: Api
+          Properties:
+            Path: /inventory
+            Method: OPTIONS
+        AuthSignup:
+          Type: Api
+          Properties:
+            Path: /auth/signup
+            Method: POST
+        AuthLogin:
+          Type: Api
+          Properties:
+            Path: /auth/login
+            Method: POST
+        AuthOptions:
+          Type: Api
+          Properties:
+            Path: /auth/{proxy+}
+            Method: OPTIONS
+
+  # CloudWatch Alarms
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: PantryInventory-LambdaErrors
+      AlarmDescription: Alert when Lambda function errors exceed threshold
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PantryInventoryFunction
+      AlarmActions:
+        - !Ref AlertTopic
+        - !If
+          - HasPagerDutyKey
+          - !Ref PagerDutyTopic
+          - !Ref AWS::NoValue
+
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: PantryInventory-LambdaDuration
+      AlarmDescription: Alert when Lambda function duration is too high
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 8000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PantryInventoryFunction
+      AlarmActions:
+        - !Ref AlertTopic
+
+  LambdaThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: PantryInventory-LambdaThrottles
+      AlarmDescription: Alert when Lambda function is throttled
+      MetricName: Throttles
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PantryInventoryFunction
+      AlarmActions:
+        - !Ref AlertTopic
+        - !If
+          - HasPagerDutyKey
+          - !Ref PagerDutyTopic
+          - !Ref AWS::NoValue
+
+  DynamoDBThrottleReadAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: PantryInventory-DynamoDBReadThrottles
+      AlarmDescription: Alert when DynamoDB read capacity is throttled
+      MetricName: ReadThrottleEvents
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: TableName
+          Value: !Ref PantryInventoryTable
+      AlarmActions:
+        - !Ref AlertTopic
+        - !If
+          - HasPagerDutyKey
+          - !Ref PagerDutyTopic
+          - !Ref AWS::NoValue
+
+  DynamoDBThrottleWriteAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: PantryInventory-DynamoDBWriteThrottles
+      AlarmDescription: Alert when DynamoDB write capacity is throttled
+      MetricName: WriteThrottleEvents
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: TableName
+          Value: !Ref PantryInventoryTable
+      AlarmActions:
+        - !Ref AlertTopic
+        - !If
+          - HasPagerDutyKey
+          - !Ref PagerDutyTopic
+          - !Ref AWS::NoValue
+
+  APIGateway5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: PantryInventory-API5xxErrors
+      AlarmDescription: Alert when API Gateway returns 5xx errors
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref ServerlessRestApi
+      AlarmActions:
+        - !Ref AlertTopic
+        - !If
+          - HasPagerDutyKey
+          - !Ref PagerDutyTopic
+          - !Ref AWS::NoValue
+
+Outputs:
+  ApiGatewayUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod
+    Export:
+      Name: PantryInventoryApiUrl
+  
+  TableName:
+    Description: DynamoDB Table Name
+    Value: !Ref PantryInventoryTable
+    Export:
+      Name: PantryInventoryTableName
+  
+  AlertTopicArn:
+    Description: SNS Topic ARN for alerts
+    Value: !Ref AlertTopic
+    Export:
+      Name: PantryInventoryAlertTopic
+
